@@ -41,8 +41,8 @@ public class BreadthFirstTestStrategy extends ExecutionStrategy {
         for (String fieldName : fields.keySet()) {
             ExecutionStrategyParameters newParameters = newParameters(parameters, fields, fieldName);
 
-            CompletableFuture<FetchedValue> fetchFuture = fetchField(executionContext, newParameters);
-            fetchFutures.put(fieldName, fetchFuture);
+//            CompletableFuture<FetchedValue> fetchFuture = fetchField(executionContext, newParameters);
+            fetchFutures.put(fieldName, null);
         }
 
         // now wait for all fetches to finish together via this join

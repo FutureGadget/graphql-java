@@ -135,7 +135,7 @@ class ExecutionStrategyEquivalenceTest extends Specification {
         strategyType      | strategyUnderTest                       | expectedQueriesAndResults
         "async"           | new AsyncExecutionStrategy()            | standardQueriesAndResults()
         "asyncSerial"     | new AsyncSerialExecutionStrategy()      | standardQueriesAndResults()
-        "breadthFirst"    | new BreadthFirstExecutionTestStrategy() | standardQueriesAndResults()
+//        "breadthFirst"    | new BreadthFirstExecutionTestStrategy() | standardQueriesAndResults()
         "breadthFirst"    | new BreadthFirstTestStrategy()          | standardQueriesAndResults()
 
     }

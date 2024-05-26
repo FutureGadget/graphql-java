@@ -17,6 +17,13 @@ public class Assert {
         throw new AssertException(msg.get());
     }
 
+    public static <T> T assertNotNull(T object, String constantMsg) {
+        if (object != null) {
+            return object;
+        }
+        return throwAssert(constantMsg);
+    }
+
     public static <T> T assertNotNullWithNPE(T object, Supplier<String> msg) {
         if (object != null) {
             return object;

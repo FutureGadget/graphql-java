@@ -1,6 +1,7 @@
 package graphql.execution;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Maps;
 import graphql.ExecutionResult;
 import graphql.ExecutionResultImpl;
 import graphql.GraphQLError;
@@ -15,6 +16,7 @@ import graphql.execution.directives.QueryDirectives;
 import graphql.execution.directives.QueryDirectivesImpl;
 import graphql.execution.instrumentation.Instrumentation;
 import graphql.execution.instrumentation.InstrumentationContext;
+import graphql.execution.instrumentation.parameters.InstrumentationExecutionStrategyParameters;
 import graphql.execution.instrumentation.parameters.InstrumentationFieldCompleteParameters;
 import graphql.execution.instrumentation.parameters.InstrumentationFieldFetchParameters;
 import graphql.execution.instrumentation.parameters.InstrumentationFieldParameters;
@@ -39,16 +41,14 @@ import graphql.schema.GraphQLSchema;
 import graphql.schema.GraphQLType;
 import graphql.util.FpKit;
 import graphql.util.LogKit;
+import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.OptionalInt;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -165,6 +165,137 @@ public abstract class ExecutionStrategy {
     public abstract CompletableFuture<ExecutionResult> execute(ExecutionContext executionContext, ExecutionStrategyParameters parameters) throws NonNullableFieldWasNullException;
 
     /**
+     * This is the re-entry point for an execution strategy when an object type needs to be resolved.
+     *
+     * @param executionContext contains the top level execution parameters
+     * @param parameters       contains the parameters holding the fields to be executed and source object
+     *
+     * @return a {@link CompletableFuture} promise to a map of object field values or a materialized map of object field values
+     *
+     * @throws NonNullableFieldWasNullException in the {@link CompletableFuture} if a non-null field resolved to a null value
+     */
+    @SuppressWarnings("unchecked")
+    protected Object /* CompletableFuture<Map<String, Object>> | Map<String, Object> */
+    executeObject(ExecutionContext executionContext, ExecutionStrategyParameters parameters) throws NonNullableFieldWasNullException {
+//        DataLoaderDispatchStrategy dataLoaderDispatcherStrategy = executionContext.getDataLoaderDispatcherStrategy();
+//        dataLoaderDispatcherStrategy.executeObject(executionContext, parameters);
+//        Instrumentation instrumentation = executionContext.getInstrumentation();
+//        InstrumentationExecutionStrategyParameters instrumentationParameters = new InstrumentationExecutionStrategyParameters(executionContext, parameters);
+
+//        ExecuteObjectInstrumentationContext resolveObjectCtx = ExecuteObjectInstrumentationContext.nonNullCtx(
+//                instrumentation.beginExecuteObject(instrumentationParameters, executionContext.getInstrumentationState())
+//        );
+
+        List<String> fieldNames = parameters.getFields().getKeys();
+
+//        DeferredExecutionSupport deferredExecutionSupport = createDeferredExecutionSupport(executionContext, parameters);
+        Async.CombinedBuilder<FieldValueInfo> resolvedFieldFutures = getAsyncFieldValueInfo(executionContext, parameters);
+
+        CompletableFuture<Map<String, Object>> overallResult = new CompletableFuture<>();
+        BiConsumer<List<Object>, Throwable> handleResultsConsumer = buildFieldValueMap(fieldNames, overallResult, executionContext);
+
+//        resolveObjectCtx.onDispatched();
+
+        Object fieldValueInfosResult = resolvedFieldFutures.awaitPolymorphic();
+        if (fieldValueInfosResult instanceof CompletableFuture) {
+            CompletableFuture<List<FieldValueInfo>> fieldValueInfos = (CompletableFuture<List<FieldValueInfo>>) fieldValueInfosResult;
+            fieldValueInfos.whenComplete((completeValueInfos, throwable) -> {
+                if (throwable != null) {
+                    handleResultsConsumer.accept(null, throwable);
+                    return;
+                }
+
+                Async.CombinedBuilder<Object> resultFutures = fieldValuesCombinedBuilder(completeValueInfos);
+//                dataLoaderDispatcherStrategy.executeObjectOnFieldValuesInfo(completeValueInfos, parameters);
+//                resolveObjectCtx.onFieldValuesInfo(completeValueInfos);
+                resultFutures.await().whenComplete(handleResultsConsumer);
+            }).exceptionally((ex) -> {
+                // if there are any issues with combining/handling the field results,
+                // complete the future at all costs and bubble up any thrown exception so
+                // the execution does not hang.
+//                dataLoaderDispatcherStrategy.executeObjectOnFieldValuesException(ex, parameters);
+//                resolveObjectCtx.onFieldValuesException();
+                overallResult.completeExceptionally(ex);
+                return null;
+            });
+//            overallResult.whenComplete(resolveObjectCtx::onCompleted);
+            return overallResult;
+        } else {
+            List<FieldValueInfo> completeValueInfos = (List<FieldValueInfo>) fieldValueInfosResult;
+
+            Async.CombinedBuilder<Object> resultFutures = fieldValuesCombinedBuilder(completeValueInfos);
+//            dataLoaderDispatcherStrategy.executeObjectOnFieldValuesInfo(completeValueInfos, parameters);
+//            resolveObjectCtx.onFieldValuesInfo(completeValueInfos);
+
+            Object completedValuesObject = resultFutures.awaitPolymorphic();
+            if (completedValuesObject instanceof CompletableFuture) {
+                CompletableFuture<List<Object>> completedValues = (CompletableFuture<List<Object>>) completedValuesObject;
+                completedValues.whenComplete(handleResultsConsumer);
+//                overallResult.whenComplete(resolveObjectCtx::onCompleted);
+                return overallResult;
+            } else {
+                Map<String, Object> fieldValueMap = buildFieldValueMap(fieldNames, (List<Object>) completedValuesObject);
+//                resolveObjectCtx.onCompleted(fieldValueMap, null);
+                return fieldValueMap;
+            }
+        }
+    }
+
+    @NotNull
+    private static Async.CombinedBuilder<Object> fieldValuesCombinedBuilder(List<FieldValueInfo> completeValueInfos) {
+        Async.CombinedBuilder<Object> resultFutures = Async.ofExpectedSize(completeValueInfos.size());
+        for (FieldValueInfo completeValueInfo : completeValueInfos) {
+            resultFutures.addObject(completeValueInfo.getFieldValueObject());
+        }
+        return resultFutures;
+    }
+
+    private BiConsumer<List<Object>, Throwable> buildFieldValueMap(List<String> fieldNames, CompletableFuture<Map<String, Object>> overallResult, ExecutionContext executionContext) {
+        return (List<Object> results, Throwable exception) -> {
+            if (exception != null) {
+                handleValueException(overallResult, exception, executionContext);
+                return;
+            }
+            Map<String, Object> resolvedValuesByField = buildFieldValueMap(fieldNames, results);
+            overallResult.complete(resolvedValuesByField);
+        };
+    }
+
+    @NotNull
+    private static Map<String, Object> buildFieldValueMap(List<String> fieldNames, List<Object> results) {
+        Map<String, Object> resolvedValuesByField = Maps.newLinkedHashMapWithExpectedSize(fieldNames.size());
+        int ix = 0;
+        for (Object fieldValue : results) {
+            String fieldName = fieldNames.get(ix++);
+            resolvedValuesByField.put(fieldName, fieldValue);
+        }
+        return resolvedValuesByField;
+    }
+
+    @NotNull
+    Async.CombinedBuilder<FieldValueInfo> getAsyncFieldValueInfo(
+            ExecutionContext executionContext,
+            ExecutionStrategyParameters parameters
+    ) {
+        MergedSelectionSet fields = parameters.getFields();
+        Async.CombinedBuilder<FieldValueInfo> futures = Async.ofExpectedSize(fields.size());
+        Async.ofExpectedSize(fields.size());
+
+        Set<String> fieldNames = fields.keySet();
+        for (String fieldName : fieldNames) {
+            MergedField currentField = fields.getSubField(fieldName);
+
+            ResultPath fieldPath = parameters.getPath().segment(mkNameForPath(currentField));
+            ExecutionStrategyParameters newParameters = parameters
+                    .transform(builder -> builder.field(currentField).path(fieldPath).parent(parameters));
+
+            Object future = resolveFieldWithInfo(executionContext, newParameters);
+            futures.addObject(future);
+        }
+        return futures;
+    }
+
+    /**
      * Called to fetch a value for a field and resolve it further in terms of the graphql query.  This will call
      * #fetchField followed by #completeField and the completed {@link ExecutionResult} is returned.
      * <p>
@@ -180,8 +311,14 @@ public abstract class ExecutionStrategy {
      *
      * @throws NonNullableFieldWasNullException in the future if a non null field resolves to a null value
      */
-    protected CompletableFuture<ExecutionResult> resolveField(ExecutionContext executionContext, ExecutionStrategyParameters parameters) {
-        return resolveFieldWithInfo(executionContext, parameters).thenCompose(FieldValueInfo::getFieldValue);
+    @SuppressWarnings("unchecked")
+    protected Object resolveField(ExecutionContext executionContext, ExecutionStrategyParameters parameters) {
+        Object fieldWithInfo = resolveFieldWithInfo(executionContext, parameters);
+        if (fieldWithInfo instanceof CompletableFuture) {
+            return ((CompletableFuture<FieldValueInfo>) fieldWithInfo).thenCompose(FieldValueInfo::getFieldValueFuture);
+        } else {
+            return ((FieldValueInfo) fieldWithInfo).getFieldValueObject();
+        }
     }
 
     /**
@@ -200,7 +337,8 @@ public abstract class ExecutionStrategy {
      *
      * @throws NonNullableFieldWasNullException in the {@link FieldValueInfo#getFieldValue()} future if a non null field resolves to a null value
      */
-    protected CompletableFuture<FieldValueInfo> resolveFieldWithInfo(ExecutionContext executionContext, ExecutionStrategyParameters parameters) {
+    @SuppressWarnings("unchecked")
+    protected Object resolveFieldWithInfo(ExecutionContext executionContext, ExecutionStrategyParameters parameters) {
         GraphQLFieldDefinition fieldDef = getFieldDef(executionContext, parameters, parameters.getField().getSingleField());
         Supplier<ExecutionStepInfo> executionStepInfo = FpKit.intraThreadMemoize(() -> createExecutionStepInfo(executionContext, parameters, fieldDef, null));
 
@@ -209,15 +347,25 @@ public abstract class ExecutionStrategy {
                 new InstrumentationFieldParameters(executionContext, executionStepInfo), executionContext.getInstrumentationState()
         ));
 
-        CompletableFuture<FetchedValue> fetchFieldFuture = fetchField(executionContext, parameters);
-        CompletableFuture<FieldValueInfo> result = fetchFieldFuture.thenApply((fetchedValue) ->
-                completeField(executionContext, parameters, fetchedValue));
+        Object fetchedValueObj = fetchField(executionContext, parameters);
+        if (fetchedValueObj instanceof CompletableFuture) {
+            CompletableFuture<FetchedValue> fetchFieldFuture = (CompletableFuture<FetchedValue>) fetchedValueObj;
+            CompletableFuture<FieldValueInfo> result = fetchFieldFuture.thenApply((fetchedValue) ->
+                    completeField(executionContext, parameters, fetchedValue));
 
-        CompletableFuture<ExecutionResult> executionResultFuture = result.thenCompose(FieldValueInfo::getFieldValue);
+            CompletableFuture<ExecutionResult> executionResultFuture = result.thenCompose(FieldValueInfo::getFieldValue);
 
-        fieldCtx.onDispatched(executionResultFuture);
-        executionResultFuture.whenComplete(fieldCtx::onCompleted);
-        return result;
+            fieldCtx.onDispatched(executionResultFuture);
+            executionResultFuture.whenComplete(fieldCtx::onCompleted);
+            return result;
+        } else {
+            try {
+                FetchedValue fetchedValue = (FetchedValue) fetchedValueObj;
+                return completeField(executionContext, parameters, fetchedValue);
+            } catch (Exception e) {
+                return Async.exceptionallyCompletedFuture(e);
+            }
+        }
     }
 
     /**
@@ -234,14 +382,15 @@ public abstract class ExecutionStrategy {
      *
      * @throws NonNullableFieldWasNullException in the future if a non null field resolves to a null value
      */
-    protected CompletableFuture<FetchedValue> fetchField(ExecutionContext executionContext, ExecutionStrategyParameters parameters) {
+    protected Object fetchField(ExecutionContext executionContext, ExecutionStrategyParameters parameters) {
         MergedField field = parameters.getField();
         GraphQLObjectType parentType = (GraphQLObjectType) parameters.getExecutionStepInfo().getUnwrappedNonNullType();
         GraphQLFieldDefinition fieldDef = getFieldDef(executionContext.getGraphQLSchema(), parentType, field.getSingleField());
         return fetchField(fieldDef, executionContext, parameters);
     }
 
-    private CompletableFuture<FetchedValue> fetchField(GraphQLFieldDefinition fieldDef, ExecutionContext executionContext, ExecutionStrategyParameters parameters) {
+    @SuppressWarnings("unchecked")
+    private Object fetchField(GraphQLFieldDefinition fieldDef, ExecutionContext executionContext, ExecutionStrategyParameters parameters) {
 
         int resultNodesCount = executionContext.getResultNodesInfo().incrementAndGetResultNodesCount();
 
@@ -249,7 +398,7 @@ public abstract class ExecutionStrategy {
         if ((maxNodes = executionContext.getGraphQLContext().get(MAX_RESULT_NODES)) != null) {
             if (resultNodesCount > maxNodes) {
                 executionContext.getResultNodesInfo().maxResultNodesExceeded();
-                return CompletableFuture.completedFuture(new FetchedValue(null, null, ImmutableKit.emptyList(), null));
+                new FetchedValue(null, null, ImmutableKit.emptyList(), null);
             }
         }
 
@@ -292,11 +441,12 @@ public abstract class ExecutionStrategy {
         );
 
         CompletableFuture<Object> fetchedValue;
+        Object fetchedObject = null;
         dataFetcher = instrumentation.instrumentDataFetcher(dataFetcher, instrumentationFieldFetchParams, executionContext.getInstrumentationState());
         ExecutionId executionId = executionContext.getExecutionId();
         try {
             Object fetchedValueRaw = dataFetcher.get(environment);
-            fetchedValue = Async.toCompletableFuture(fetchedValueRaw);
+            fetchedObject = Async.toCompletableFutureOrMaterializedObject(fetchedValueRaw);
         } catch (Exception e) {
             if (logNotSafe.isDebugEnabled()) {
                 logNotSafe.debug(String.format("'%s', field '%s' fetch threw exception", executionId, executionStepInfo.get().getPath()), e);
@@ -305,18 +455,24 @@ public abstract class ExecutionStrategy {
             fetchedValue = new CompletableFuture<>();
             fetchedValue.completeExceptionally(e);
         }
-        fetchCtx.onDispatched(fetchedValue);
-        return fetchedValue
-                .handle((result, exception) -> {
-                    fetchCtx.onCompleted(result, exception);
-                    if (exception != null) {
-                        return handleFetchingException(executionContext, environment, exception);
-                    } else {
-                        return CompletableFuture.completedFuture(result);
-                    }
-                })
-                .thenCompose(Function.identity())
-                .thenApply(result -> unboxPossibleDataFetcherResult(executionContext, parameters, result));
+
+        if (fetchedObject instanceof CompletableFuture) {
+            fetchedValue = (CompletableFuture<Object>) fetchedObject;
+            fetchCtx.onDispatched(fetchedValue);
+            return fetchedValue
+                    .handle((result, exception) -> {
+                        fetchCtx.onCompleted(result, exception);
+                        if (exception != null) {
+                            return handleFetchingException(executionContext, environment, exception);
+                        } else {
+                            return CompletableFuture.completedFuture(result);
+                        }
+                    })
+                    .thenCompose(Function.identity())
+                    .thenApply(result -> unboxPossibleDataFetcherResult(executionContext, parameters, result));
+        } else {
+            return unboxPossibleDataFetcherResult(executionContext, parameters, fetchedObject);
+        }
     }
 
     protected Supplier<ExecutableNormalizedField> getNormalizedField(ExecutionContext executionContext, ExecutionStrategyParameters parameters, Supplier<ExecutionStepInfo> executionStepInfo) {
@@ -422,9 +578,9 @@ public abstract class ExecutionStrategy {
 
         FieldValueInfo fieldValueInfo = completeValue(executionContext, newParameters);
 
-        CompletableFuture<ExecutionResult> executionResultFuture = fieldValueInfo.getFieldValue();
-        ctxCompleteField.onDispatched(executionResultFuture);
-        executionResultFuture.whenComplete(ctxCompleteField::onCompleted);
+//        CompletableFuture<Object> executionResultFuture = fieldValueInfo.getFieldValueFuture();
+//        ctxCompleteField.onDispatched(executionResultFuture);
+//        executionResultFuture.whenComplete(ctxCompleteField::onCompleted);
         return fieldValueInfo;
     }
 
@@ -449,19 +605,19 @@ public abstract class ExecutionStrategy {
         ExecutionStepInfo executionStepInfo = parameters.getExecutionStepInfo();
         Object result = executionContext.getValueUnboxer().unbox(parameters.getSource());
         GraphQLType fieldType = executionStepInfo.getUnwrappedNonNullType();
-        CompletableFuture<ExecutionResult> fieldValue;
+        Object fieldValue;
 
         if (result == null) {
             fieldValue = completeValueForNull(executionContext, parameters);
-            return FieldValueInfo.newFieldValueInfo(NULL).fieldValue(fieldValue).build();
+            return new FieldValueInfo(NULL, fieldValue);
         } else if (isList(fieldType)) {
             return completeValueForList(executionContext, parameters, result);
         } else if (isScalar(fieldType)) {
             fieldValue = completeValueForScalar(executionContext, parameters, (GraphQLScalarType) fieldType, result);
-            return FieldValueInfo.newFieldValueInfo(SCALAR).fieldValue(fieldValue).build();
+            return new FieldValueInfo(SCALAR, fieldValue);
         } else if (isEnum(fieldType)) {
             fieldValue = completeValueForEnum(executionContext, parameters, (GraphQLEnumType) fieldType, result);
-            return FieldValueInfo.newFieldValueInfo(ENUM).fieldValue(fieldValue).build();
+            return new FieldValueInfo(ENUM, fieldValue);
         }
 
         // when we are here, we have a complex type: Interface, Union or Object
@@ -477,9 +633,10 @@ public abstract class ExecutionStrategy {
             // and validate the field is nullable, if non-nullable throw exception
             parameters.getNonNullFieldValidator().validate(parameters.getPath(), null);
             // complete the field as null
-            fieldValue = completedFuture(new ExecutionResultImpl(null, executionContext.getErrors()));
+            fieldValue = completeValueForNull(executionContext, parameters);
+            return new FieldValueInfo(NULL, fieldValue);
         }
-        return FieldValueInfo.newFieldValueInfo(OBJECT).fieldValue(fieldValue).build();
+        return new FieldValueInfo(OBJECT, fieldValue);
     }
 
     private void handleUnresolvedTypeProblem(ExecutionContext context, ExecutionStrategyParameters parameters, UnresolvedTypeException e) {
@@ -489,11 +646,12 @@ public abstract class ExecutionStrategy {
 
     }
 
-    protected CompletableFuture<ExecutionResult> completeValueForNull(ExecutionContext executionContext, ExecutionStrategyParameters parameters) {
-        return Async.tryCatch(() -> {
-            Object nullValue = parameters.getNonNullFieldValidator().validate(parameters.getPath(), null);
-            return completedFuture(new ExecutionResultImpl(nullValue, executionContext.getErrors()));
-        });
+    protected Object completeValueForNull(ExecutionContext executionContext, ExecutionStrategyParameters parameters) {
+        try {
+            return parameters.getNonNullFieldValidator().validate(parameters.getPath(), null);
+        } catch (Exception e) {
+            return Async.exceptionallyCompletedFuture(e);
+        }
     }
 
     /**
@@ -511,10 +669,10 @@ public abstract class ExecutionStrategy {
         try {
             resultIterable = parameters.getNonNullFieldValidator().validate(parameters.getPath(), resultIterable);
         } catch (NonNullableFieldWasNullException e) {
-            return FieldValueInfo.newFieldValueInfo(LIST).fieldValue(exceptionallyCompletedFuture(e)).build();
+            return new FieldValueInfo(LIST, exceptionallyCompletedFuture(e));
         }
         if (resultIterable == null) {
-            return FieldValueInfo.newFieldValueInfo(LIST).fieldValue(completedFuture(new ExecutionResultImpl(null, executionContext.getErrors()))).build();
+            return new FieldValueInfo(LIST, null);
         }
         return completeValueForList(executionContext, parameters, resultIterable);
     }
@@ -549,7 +707,7 @@ public abstract class ExecutionStrategy {
             if ((maxNodes = executionContext.getGraphQLContext().get(MAX_RESULT_NODES)) != null) {
                 if (resultNodesCount > maxNodes) {
                     executionContext.getResultNodesInfo().maxResultNodesExceeded();
-                    return new FieldValueInfo(NULL, completedFuture(ExecutionResultImpl.newExecutionResult().build()), fieldValueInfos);
+                    return new FieldValueInfo(NULL, null, fieldValueInfos);
                 }
             }
 
@@ -575,30 +733,49 @@ public abstract class ExecutionStrategy {
             index++;
         }
 
-        CompletableFuture<List<ExecutionResult>> resultsFuture = Async.each(fieldValueInfos, (item, i) -> item.getFieldValue());
+        Object listResults = Async.eachPolymorphic(fieldValueInfos, FieldValueInfo::getFieldValueObject);
+        Object listOrPromiseToList;
+        if (listResults instanceof CompletableFuture) {
+            @SuppressWarnings("unchecked")
+            CompletableFuture<List<Object>> resultsFuture = (CompletableFuture<List<Object>>) listResults;
+            CompletableFuture<Object> overallResult = new CompletableFuture<>();
+//            completeListCtx.onDispatched();
+//            overallResult.whenComplete(completeListCtx::onCompleted);
+            resultsFuture.whenComplete((results, exception) -> {
+                if (exception != null) {
+                    handleValueException(overallResult, exception, executionContext);
+                    return;
+                }
+                List<Object> completedResults = new ArrayList<>(results.size());
+                completedResults.addAll(results);
+                overallResult.complete(completedResults);
+            });
+            listOrPromiseToList = overallResult;
+        } else {
+            listOrPromiseToList = listResults;
+        }
+        return new FieldValueInfo(LIST, listOrPromiseToList, fieldValueInfos);
+    }
 
-        CompletableFuture<ExecutionResult> overallResult = new CompletableFuture<>();
-        completeListCtx.onDispatched(overallResult);
-
-        resultsFuture.whenComplete((results, exception) -> {
-            if (exception != null) {
-                ExecutionResult executionResult = handleNonNullException(executionContext, overallResult, exception);
-                completeListCtx.onCompleted(executionResult, exception);
-                return;
+    protected <T> void handleValueException(CompletableFuture<T> overallResult, Throwable e, ExecutionContext executionContext) {
+        Throwable underlyingException = e;
+        if (e instanceof CompletionException) {
+            underlyingException = e.getCause();
+        }
+        if (underlyingException instanceof NonNullableFieldWasNullException) {
+            assertNonNullFieldPrecondition((NonNullableFieldWasNullException) underlyingException, overallResult);
+            if (!overallResult.isDone()) {
+                overallResult.complete(null);
             }
-            List<Object> completedResults = new ArrayList<>(results.size());
-            for (ExecutionResult completedValue : results) {
-                completedResults.add(completedValue.getData());
+        } else if (underlyingException instanceof AbortExecutionException) {
+            AbortExecutionException abortException = (AbortExecutionException) underlyingException;
+            executionContext.addError(abortException);
+            if (!overallResult.isDone()) {
+                overallResult.complete(null);
             }
-            ExecutionResultImpl executionResult = new ExecutionResultImpl(completedResults, executionContext.getErrors());
-            overallResult.complete(executionResult);
-        });
-        overallResult.whenComplete(completeListCtx::onCompleted);
-
-        return FieldValueInfo.newFieldValueInfo(LIST)
-                .fieldValue(overallResult)
-                .fieldValueInfos(fieldValueInfos)
-                .build();
+        } else {
+            overallResult.completeExceptionally(e);
+        }
     }
 
     /**
@@ -668,7 +845,7 @@ public abstract class ExecutionStrategy {
      *
      * @return a promise to an {@link ExecutionResult}
      */
-    protected CompletableFuture<ExecutionResult> completeValueForObject(ExecutionContext executionContext, ExecutionStrategyParameters parameters, GraphQLObjectType resolvedObjectType, Object result) {
+    protected Object completeValueForObject(ExecutionContext executionContext, ExecutionStrategyParameters parameters, GraphQLObjectType resolvedObjectType, Object result) {
         ExecutionStepInfo executionStepInfo = parameters.getExecutionStepInfo();
 
         FieldCollectorParameters collectorParameters = newParameters()
@@ -692,7 +869,7 @@ public abstract class ExecutionStrategy {
 
         // Calling this from the executionContext to ensure we shift back from mutation strategy to the query strategy.
 
-        return executionContext.getQueryStrategy().execute(executionContext, newParameters);
+        return executionContext.getQueryStrategy().executeObject(executionContext, newParameters);
     }
 
     @SuppressWarnings("SameReturnValue")
@@ -720,6 +897,10 @@ public abstract class ExecutionStrategy {
     }
 
     protected GraphQLObjectType resolveType(ExecutionContext executionContext, ExecutionStrategyParameters parameters, GraphQLType fieldType) {
+        // we can avoid a method call and type resolver environment allocation if we know it's an object type
+        if (fieldType instanceof GraphQLObjectType) {
+            return (GraphQLObjectType) fieldType;
+        }
         return resolvedType.resolveType(executionContext, parameters.getField(), parameters.getSource(), parameters.getExecutionStepInfo(), fieldType, parameters.getLocalContext());
     }
 
